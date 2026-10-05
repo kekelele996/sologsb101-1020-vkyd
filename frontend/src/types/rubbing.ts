@@ -28,10 +28,16 @@ export interface Rubbing {
   sizeCm: string;
   /** 收藏号 */
   collectionNo: string;
-  /** 年代判断 */
+  /** 年代判断（编目员著录，对账回填不影响此字段） */
   dateGuess: string;
   /** 状态 */
   state: RubbingState;
+  /** 联合目录号（中心对账回填；空串 = 未对账） */
+  unionCatalogNo: string;
+  /** 中心著录年代（中心对账回填，同一条目晚到的为准） */
+  centerDate: string;
+  /** 最近一次对账写入时间戳；null = 从未对账 */
+  reconciledAt: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -99,5 +105,13 @@ export function createEmptyRubbingDraft(steleId: string, versionNo: number): Rub
     collectionNo: '',
     dateGuess: '',
     state: 'toCatalog',
+    unionCatalogNo: '',
+    centerDate: '',
+    reconciledAt: null,
   };
+}
+
+/** 是否已与联合目录中心对账（联合目录号非空即视为已对账） */
+export function isRubbingReconciled(rubbing: Rubbing): boolean {
+  return rubbing.unionCatalogNo.trim().length > 0;
 }

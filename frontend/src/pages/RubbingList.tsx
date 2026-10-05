@@ -1,7 +1,8 @@
 /**
  * /rubbings 拓本登记
  * 录入拓法、纸墨、尺寸与收藏号并管理钤印；同一碑刻下自动生成版本序号，支持批量改状态。
- * 消费 Rubbing、Seal、Stele；复用 <FilterBar>、<StatBadge>、<EmptyPanel>、<LossTag>。
+ * 收下中心对账清单回填联合目录号与中心著录年代，查不到收藏号的条目列入待认领。
+ * 消费 Rubbing、Seal、Stele、ReconClaim；复用 <FilterBar>、<StatBadge>、<EmptyPanel>、<LossTag>。
  */
 import { useEffect, useMemo, useState } from 'react';
 import {
@@ -19,7 +20,7 @@ import {
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { DeleteOutlined, EditOutlined, PlusOutlined, TagsOutlined } from '@ant-design/icons';
+import { AuditOutlined, DeleteOutlined, EditOutlined, PlusOutlined, TagsOutlined } from '@ant-design/icons';
 import EmptyPanel from '@/components/common/EmptyPanel';
 import FilterBar, { useFilterQuery, type FilterSelectConfig } from '@/components/common/FilterBar';
 import StatBadge from '@/components/common/StatBadge';
@@ -27,15 +28,18 @@ import { useAppDispatch, useAppSelector } from '@/stores/store';
 import { selectSteles, setCurrentStele } from '@/stores/steleSlice';
 import {
   advanceRubbingState,
+  applyReconciliationList,
   batchUpdateRubbings,
   batchUpdateSeals,
   createRubbing,
   createSeal,
   loadRubbings,
+  removeReconClaim,
   removeRubbing,
   removeSeal,
   resetRubbingFilters,
   selectFilteredRubbings,
+  selectReconClaims,
   selectRubbings,
   selectSeals,
   setRubbingMethods,
@@ -55,12 +59,14 @@ import {
   RUBBING_STATE_LABEL,
   RUBBING_STATE_OPTIONS,
   createEmptyRubbingDraft,
+  isRubbingReconciled,
   type InkTone,
   type Rubbing,
   type RubbingDraft,
   type RubbingMethod,
   type RubbingState,
 } from '@/types/rubbing';
+import type { ReconClaim } from '@/types/recon';
 import {
   SEAL_POSITION_OPTIONS,
   SEAL_TYPE_COLOR,
@@ -87,6 +93,7 @@ export default function RubbingList() {
   const rubbings = useAppSelector(selectRubbings);
   const filtered = useAppSelector(selectFilteredRubbings);
   const seals = useAppSelector(selectSeals);
+  const claims = useAppSelector(selectReconClaims);
   const losses = useAppSelector(selectLosses);
   const steleFilterId = useAppSelector((state) => state.rubbing.filters.steleId);
 
@@ -95,6 +102,10 @@ export default function RubbingList() {
   const [editing, setEditing] = useState<Rubbing | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [batchState, setBatchState] = useState<RubbingState>('cataloged');
+
+  const [reconOpen, setReconOpen] = useState(false);
+  const [reconText, setReconText] = useState('');
+  const [reconSubmitting, setReconSubmitting] = useState(false);
 
   const [sealOpen, setSealOpen] = useState(false);
   const [sealRubbing, setSealRubbing] = useState<Rubbing | null>(null);
@@ -124,6 +135,7 @@ export default function RubbingList() {
       cataloged,
       catalogedPercent: total === 0 ? 0 : Math.round((cataloged / total) * 100),
       toCompare: rubbings.filter((rubbing) => rubbing.state === 'toCompare').length,
+      reconciled: rubbings.filter((rubbing) => isRubbingReconciled(rubbing)).length,
       seals: seals.length,
       losses: losses.length,
     };
@@ -175,6 +187,22 @@ export default function RubbingList() {
     setOpen(false);
   };
 
+  /** 收下中心对账清单：入库失败时 thunk 拒绝，本地保持贴入前的样子 */
+  const submitRecon = async (): Promise<void> => {
+    setReconSubmitting(true);
+    try {
+      const summary = await dispatch(applyReconciliationList(reconText)).unwrap();
+      const skippedTip = summary.skipped > 0 ? `，跳过无法识别的 ${summary.skipped} 行` : '';
+      message.success(`对账完成：对上 ${summary.matchedCount} 条，待认领 ${summary.claimCount} 条${skippedTip}`);
+      setReconOpen(false);
+      setReconText('');
+    } catch (error) {
+      message.error(`对账未入库，数据保持原样：${error instanceof Error ? error.message : '未知错误'}`);
+    } finally {
+      setReconSubmitting(false);
+    }
+  };
+
   const openSeals = (rubbing: Rubbing): void => {
     setSealRubbing(rubbing);
     setEditingSeal(null);
@@ -217,6 +245,22 @@ export default function RubbingList() {
     { title: '尺寸', dataIndex: 'sizeCm', width: 110, render: (value: string) => value || '未记' },
     { title: '收藏号', dataIndex: 'collectionNo', width: 120, render: (value: string) => value || '未编' },
     { title: '年代判断', dataIndex: 'dateGuess', width: 120, render: (value: string) => value || '待考' },
+    {
+      title: '联合目录对账',
+      key: 'recon',
+      width: 190,
+      render: (_value, record) =>
+        isRubbingReconciled(record) ? (
+          <Space direction="vertical" size={0}>
+            <Tag color="#2f6f4f">{record.unionCatalogNo}</Tag>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              中心著录：{record.centerDate || '未记'}
+            </Typography.Text>
+          </Space>
+        ) : (
+          <Tag>未对账</Tag>
+        ),
+    },
     {
       title: '损泐 / 钤印',
       key: 'counts',
@@ -274,12 +318,46 @@ export default function RubbingList() {
         .sort((a, b) => sealPositionWeight(a.position) - sealPositionWeight(b.position))
     : [];
 
+  const claimColumns: ColumnsType<ReconClaim> = [
+    { title: '收藏号', dataIndex: 'collectionNo', width: 130 },
+    { title: '联合目录号', dataIndex: 'unionCatalogNo', width: 150 },
+    { title: '中心著录年代', dataIndex: 'centerDate', width: 140, render: (value: string) => value || '未记' },
+    {
+      title: '收到时间',
+      dataIndex: 'receivedAt',
+      width: 170,
+      render: (value: number) => new Date(value).toLocaleString('zh-CN'),
+    },
+    {
+      title: '操作',
+      key: 'action',
+      width: 90,
+      render: (_value, record) => (
+        <Popconfirm
+          title="移除待认领条目"
+          description="仅在中心确认撤回该条目时移除。"
+          okText="确认"
+          cancelText="取消"
+          onConfirm={() =>
+            void dispatch(removeReconClaim(record.id))
+              .unwrap()
+              .then(() => message.success('已移除待认领条目'))
+          }
+        >
+          <Button size="small" type="link" danger icon={<DeleteOutlined />}>
+            移除
+          </Button>
+        </Popconfirm>
+      ),
+    },
+  ];
+
   return (
     <div>
       <div className="gb-page-head">
         <div>
           <h2>拓本登记</h2>
-          <p>录入拓法、纸墨、尺寸与收藏号；同一碑刻下自动生成版本序号，并可管理钤印与批量改状态。</p>
+          <p>录入拓法、纸墨、尺寸与收藏号；同一碑刻下自动生成版本序号，并可管理钤印、批量改状态与中心对账。</p>
         </div>
         <Space wrap>
           <Select
@@ -293,6 +371,9 @@ export default function RubbingList() {
               if (value) dispatch(setCurrentStele(value));
             }}
           />
+          <Button icon={<AuditOutlined />} onClick={() => setReconOpen(true)}>
+            中心对账
+          </Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>
             登记拓本
           </Button>
@@ -303,6 +384,8 @@ export default function RubbingList() {
         <StatBadge label="拓本总数" value={stat.total} suffix="份" tone="primary" />
         <StatBadge label="已编目占比" value={`${stat.catalogedPercent}%`} percent={stat.catalogedPercent} tone="success" />
         <StatBadge label="待比对" value={stat.toCompare} suffix="份" tone="warning" />
+        <StatBadge label="已对账" value={stat.reconciled} suffix="份" tone="info" />
+        <StatBadge label="待认领" value={claims.length} suffix="条" tone="danger" />
         <StatBadge label="钤印总数" value={stat.seals} suffix="方" tone="info" />
         <StatBadge label="损泐字位" value={stat.losses} suffix="条" tone="danger" />
       </div>
@@ -374,6 +457,52 @@ export default function RubbingList() {
           />
         )}
       </Card>
+
+      <Card
+        className="gb-table-card"
+        style={{ marginTop: 16 }}
+        styles={{ body: { padding: 0 } }}
+        title={`中心对账待认领（${claims.length} 条）`}
+      >
+        {claims.length === 0 ? (
+          <EmptyPanel
+            title="没有待认领的对账条目"
+            description="中心清单里对不上收藏号的条目会列在这里等认领；登记对应拓本或更正收藏号后自动认领，不会丢弃。"
+            size="small"
+          />
+        ) : (
+          <Table<ReconClaim>
+            rowKey="id"
+            size="small"
+            pagination={{ pageSize: 5 }}
+            columns={claimColumns}
+            dataSource={claims}
+          />
+        )}
+      </Card>
+
+      <Modal
+        open={reconOpen}
+        title="收下中心对账清单"
+        onCancel={() => setReconOpen(false)}
+        onOk={() => void submitRecon()}
+        okText="对账入库"
+        cancelText="取消"
+        confirmLoading={reconSubmitting}
+        destroyOnClose
+      >
+        <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+          粘贴馆际联合目录中心发回的对账清单，一行一条：先收藏号，再联合目录号和中心著录年代（Tab、逗号或空格分隔）。
+          对上的条目只回填联合目录号与中心著录年代，拓法、纸墨、尺寸与损泐字位保持原样；同一收藏号重复发来时以晚到的为准。
+          查不到收藏号的条目列入「待认领」，不会丢弃；写库失败则整体回到贴入前的样子。
+        </Typography.Paragraph>
+        <Input.TextArea
+          rows={8}
+          value={reconText}
+          onChange={(event) => setReconText(event.target.value)}
+          placeholder={'TB-0101\tUC-000101\t明嘉靖间拓\nTB-0201, UC-000201, 清中期拓'}
+        />
+      </Modal>
 
       <Modal
         open={open}

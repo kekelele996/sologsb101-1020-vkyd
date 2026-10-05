@@ -1,7 +1,9 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据结构版本号与升级迁移逻辑（v1 → v2：Loss 增加 charNo 与复合索引，并按行号顺序重建历史字位记录）
- * - 五张业务表的增删改查与整库导入导出
+ * - 数据结构版本号与升级迁移逻辑（v1 → v2：Loss 增加 charNo 与复合索引，并按行号顺序重建历史字位记录；
+ *   v2 → v3：新增 reconClaims 待认领表，Rubbing 增加联合目录对账字段，历史拓本一律置为未对账）
+ * - 六张业务表的增删改查与整库导入导出
+ * - 中心对账清单的单事务写入（失败整体回滚）与待认领条目的自动认领
  * - 首次打开自动播种三层互相引用的演示数据（幂等）
  * 纯前端应用：不依赖任何后端服务或数据库。
  */
@@ -11,13 +13,15 @@ import type { Rubbing } from '@/types/rubbing';
 import type { Loss } from '@/types/loss';
 import type { Seal } from '@/types/seal';
 import type { Compare } from '@/types/compare';
+import type { ReconClaim, ReconEntry } from '@/types/recon';
 import { sortLosses } from './collate';
+import { planReconciliation } from './recon';
 
 /** 数据库名（README 与导出文件均使用该名称） */
 export const DB_NAME = 'gbrubbing';
 
 /** 当前数据结构版本号 */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** localStorage 侧少量元数据键 */
 export const LS_KEYS = {
@@ -85,6 +89,7 @@ class RubbingDatabase extends Dexie {
   losses!: Table<Loss, string>;
   seals!: Table<Seal, string>;
   compares!: Table<Compare, string>;
+  reconClaims!: Table<ReconClaim, string>;
 
   constructor() {
     super(DB_NAME);
@@ -99,7 +104,7 @@ class RubbingDatabase extends Dexie {
     });
 
     // v2：Loss 增加 charNo 与 [rubbingId+lineNo+charNo] 复合索引，并按行号顺序重建历史字位记录
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         steles: 'id, title, era, form, location, updatedAt',
         rubbings: 'id, steleId, versionNo, method, inkTone, state, updatedAt',
@@ -128,6 +133,23 @@ class RubbingDatabase extends Dexie {
         });
         await table.bulkPut(sortLosses(rebuilt));
       });
+
+    // v3：新增 reconClaims 待认领表；Rubbing 增加联合目录对账字段，历史拓本一律置为未对账
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        steles: 'id, title, era, form, location, updatedAt',
+        rubbings: 'id, steleId, versionNo, method, inkTone, state, updatedAt',
+        losses: 'id, rubbingId, lineNo, charNo, [rubbingId+lineNo+charNo], type, severity, updatedAt',
+        seals: 'id, rubbingId, sealType, position, updatedAt',
+        compares: 'id, steleId, rubbingIdA, rubbingIdB, conclusion, date, updatedAt',
+        reconClaims: 'id, collectionNo, receivedAt, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        const table = tx.table<Rubbing>('rubbings');
+        const all = await table.toArray();
+        // 本馆已有数据升级上来也按未对账显示：对账字段补空值
+        await table.bulkPut(all.map((row) => normalizeRubbing(row)));
+      });
   }
 }
 
@@ -137,6 +159,16 @@ export const db = new RubbingDatabase();
 export function createId(prefix: string): string {
   const rand = Math.random().toString(36).slice(2, 8);
   return `${prefix}_${Date.now().toString(36)}${rand}`;
+}
+
+/** 补齐拓本的联合目录对账字段：缺失的一律按未对账处理（升级与导入旧备份共用） */
+export function normalizeRubbing(row: Rubbing): Rubbing {
+  return {
+    ...row,
+    unionCatalogNo: typeof row.unionCatalogNo === 'string' ? row.unionCatalogNo : '',
+    centerDate: typeof row.centerDate === 'string' ? row.centerDate : '',
+    reconciledAt: typeof row.reconciledAt === 'number' ? row.reconciledAt : null,
+  };
 }
 
 /** 打开数据库并在首次使用时播种演示数据（幂等） */
@@ -192,11 +224,11 @@ export async function seedDatabase(): Promise<void> {
   ];
 
   const rubbings: Rubbing[] = [
-    { id: 'rub_0101', steleId: 'stele_01', versionNo: 1, method: 'rub', paperType: '宣纸', inkTone: 'thick', sizeCm: '210×88', collectionNo: 'TB-0101', dateGuess: '明拓', state: 'cataloged', createdAt: now - day * 50, updatedAt: now - day * 10 },
-    { id: 'rub_0102', steleId: 'stele_01', versionNo: 2, method: 'cicada', paperType: '棉连纸', inkTone: 'light', sizeCm: '208×86', collectionNo: 'TB-0102', dateGuess: '清拓', state: 'toCompare', createdAt: now - day * 44, updatedAt: now - day * 6 },
-    { id: 'rub_0201', steleId: 'stele_02', versionNo: 1, method: 'pat', paperType: '皮纸', inkTone: 'thick', sizeCm: '250×196', collectionNo: 'TB-0201', dateGuess: '清中期拓', state: 'cataloged', createdAt: now - day * 40, updatedAt: now - day * 5 },
-    { id: 'rub_0202', steleId: 'stele_02', versionNo: 2, method: 'rub', paperType: '棉连纸', inkTone: 'light', sizeCm: '248×194', collectionNo: 'TB-0202', dateGuess: '清晚期拓', state: 'toCatalog', createdAt: now - day * 34, updatedAt: now - day * 4 },
-    { id: 'rub_0301', steleId: 'stele_03', versionNo: 1, method: 'rub', paperType: '净皮宣', inkTone: 'thick', sizeCm: '260×90', collectionNo: 'TB-0301', dateGuess: '民国拓', state: 'toCatalog', createdAt: now - day * 20, updatedAt: now - day * 2 },
+    { id: 'rub_0101', steleId: 'stele_01', versionNo: 1, method: 'rub', paperType: '宣纸', inkTone: 'thick', sizeCm: '210×88', collectionNo: 'TB-0101', dateGuess: '明拓', state: 'cataloged', unionCatalogNo: '', centerDate: '', reconciledAt: null, createdAt: now - day * 50, updatedAt: now - day * 10 },
+    { id: 'rub_0102', steleId: 'stele_01', versionNo: 2, method: 'cicada', paperType: '棉连纸', inkTone: 'light', sizeCm: '208×86', collectionNo: 'TB-0102', dateGuess: '清拓', state: 'toCompare', unionCatalogNo: '', centerDate: '', reconciledAt: null, createdAt: now - day * 44, updatedAt: now - day * 6 },
+    { id: 'rub_0201', steleId: 'stele_02', versionNo: 1, method: 'pat', paperType: '皮纸', inkTone: 'thick', sizeCm: '250×196', collectionNo: 'TB-0201', dateGuess: '清中期拓', state: 'cataloged', unionCatalogNo: '', centerDate: '', reconciledAt: null, createdAt: now - day * 40, updatedAt: now - day * 5 },
+    { id: 'rub_0202', steleId: 'stele_02', versionNo: 2, method: 'rub', paperType: '棉连纸', inkTone: 'light', sizeCm: '248×194', collectionNo: 'TB-0202', dateGuess: '清晚期拓', state: 'toCatalog', unionCatalogNo: '', centerDate: '', reconciledAt: null, createdAt: now - day * 34, updatedAt: now - day * 4 },
+    { id: 'rub_0301', steleId: 'stele_03', versionNo: 1, method: 'rub', paperType: '净皮宣', inkTone: 'thick', sizeCm: '260×90', collectionNo: 'TB-0301', dateGuess: '民国拓', state: 'toCatalog', unionCatalogNo: '', centerDate: '', reconciledAt: null, createdAt: now - day * 20, updatedAt: now - day * 2 },
   ];
 
   const losses: Loss[] = [
@@ -244,15 +276,17 @@ export interface RubbingSnapshot {
   losses: Loss[];
   seals: Seal[];
   compares: Compare[];
+  reconClaims: ReconClaim[];
 }
 
 export async function exportSnapshot(): Promise<RubbingSnapshot> {
-  const [steles, rubbings, losses, seals, compares] = await Promise.all([
+  const [steles, rubbings, losses, seals, compares, reconClaims] = await Promise.all([
     db.steles.toArray(),
     db.rubbings.toArray(),
     db.losses.toArray(),
     db.seals.toArray(),
     db.compares.toArray(),
+    db.reconClaims.toArray(),
   ]);
   return {
     app: DB_NAME,
@@ -263,6 +297,7 @@ export async function exportSnapshot(): Promise<RubbingSnapshot> {
     losses,
     seals,
     compares,
+    reconClaims,
   };
 }
 
@@ -275,29 +310,36 @@ export function validateSnapshot(input: unknown): string {
   for (const key of keys) {
     if (!Array.isArray(snapshot[key])) return `备份文件缺少 ${String(key)} 集合`;
   }
+  // reconClaims 为 v3 新增集合：旧备份允许缺省，存在则必须是数组
+  if (snapshot.reconClaims !== undefined && !Array.isArray(snapshot.reconClaims)) {
+    return '备份文件的 reconClaims 集合不是数组';
+  }
   return '';
 }
 
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
+  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.reconClaims], async () => {
     await Promise.all([
       db.steles.clear(),
       db.rubbings.clear(),
       db.losses.clear(),
       db.seals.clear(),
       db.compares.clear(),
+      db.reconClaims.clear(),
     ]);
   });
 }
 
 export async function importSnapshot(snapshot: RubbingSnapshot): Promise<void> {
   await clearAllTables();
-  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares], async () => {
+  await db.transaction('rw', [db.steles, db.rubbings, db.losses, db.seals, db.compares, db.reconClaims], async () => {
     await db.steles.bulkPut(snapshot.steles);
-    await db.rubbings.bulkPut(snapshot.rubbings);
+    // 旧版本备份的拓本缺少对账字段：补齐后一律按未对账显示
+    await db.rubbings.bulkPut(snapshot.rubbings.map((row) => normalizeRubbing(row)));
     await db.losses.bulkPut(snapshot.losses);
     await db.seals.bulkPut(snapshot.seals);
     await db.compares.bulkPut(snapshot.compares);
+    await db.reconClaims.bulkPut(snapshot.reconClaims ?? []);
   });
 }
 
@@ -307,14 +349,15 @@ export async function resetDatabase(): Promise<void> {
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [steles, rubbings, losses, seals, compares] = await Promise.all([
+  const [steles, rubbings, losses, seals, compares, reconClaims] = await Promise.all([
     db.steles.count(),
     db.rubbings.count(),
     db.losses.count(),
     db.seals.count(),
     db.compares.count(),
+    db.reconClaims.count(),
   ]);
-  return { steles, rubbings, losses, seals, compares };
+  return { steles, rubbings, losses, seals, compares, reconClaims };
 }
 
 /** 级联删除碑刻 → 拓本 → 损泐 / 钤印 / 比对 */
@@ -348,4 +391,92 @@ export async function renumberRubbings(steleId: string): Promise<void> {
   const rows = await db.rubbings.where('steleId').equals(steleId).toArray();
   const sorted = [...rows].sort((a, b) => (a.versionNo === b.versionNo ? a.createdAt - b.createdAt : a.versionNo - b.versionNo));
   await db.rubbings.bulkPut(sorted.map((row, index) => ({ ...row, versionNo: index + 1, updatedAt: Date.now() })));
+}
+
+/* ------------------------------ 中心对账 ------------------------------ */
+
+export interface ReconApplyResult {
+  /** 对上并回填的条数 */
+  matchedCount: number;
+  /** 查不到收藏号、转入待认领的条数 */
+  claimCount: number;
+}
+
+/**
+ * 应用中心对账清单：单事务写入，任一步失败整体回滚到贴入前的状态。
+ * 对上的条目只回填 unionCatalogNo / centerDate / reconciledAt，
+ * 编目员著录的拓法、纸墨、尺寸、年代判断与损泐字位一律不动；
+ * 同一收藏号再次发来时以晚到的为准覆盖；查不到的条目留存为待认领。
+ */
+export async function applyReconciliationEntries(entries: ReconEntry[]): Promise<ReconApplyResult> {
+  const now = Date.now();
+  return db.transaction('rw', [db.rubbings, db.reconClaims], async () => {
+    const rubbings = await db.rubbings.toArray();
+    const plan = planReconciliation(entries, rubbings);
+
+    // 对上的：只补联合目录号与中心著录年代（晚到覆盖早到）
+    for (const match of plan.matched) {
+      await db.rubbings.update(match.rubbingId, {
+        unionCatalogNo: match.entry.unionCatalogNo,
+        centerDate: match.entry.centerDate,
+        reconciledAt: now,
+        updatedAt: now,
+      } as never);
+    }
+
+    // 对上的收藏号若曾挂待认领，一并销掉
+    const matchedNos = plan.matched.map((match) => match.entry.collectionNo);
+    if (matchedNos.length > 0) {
+      await db.reconClaims.where('collectionNo').anyOf(matchedNos).delete();
+    }
+
+    // 查不到的：留存待认领；同收藏号已有待认领的以晚到为准覆盖
+    const existingClaims = await db.reconClaims.toArray();
+    const claimByNo = new Map(existingClaims.map((row) => [row.collectionNo, row]));
+    for (const entry of plan.unmatched) {
+      const claim = claimByNo.get(entry.collectionNo);
+      if (claim) {
+        await db.reconClaims.update(claim.id, {
+          unionCatalogNo: entry.unionCatalogNo,
+          centerDate: entry.centerDate,
+          receivedAt: now,
+          updatedAt: now,
+        } as never);
+      } else {
+        await db.reconClaims.put({
+          id: createId('claim'),
+          collectionNo: entry.collectionNo,
+          unionCatalogNo: entry.unionCatalogNo,
+          centerDate: entry.centerDate,
+          receivedAt: now,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+    }
+
+    return { matchedCount: plan.matched.length, claimCount: plan.unmatched.length };
+  });
+}
+
+/**
+ * 自动认领：拓本登记或改收藏号后，若该收藏号挂着待认领条目，
+ * 把中心的联合目录号与著录年代补到拓本上并销掉待认领条目。
+ */
+export async function claimPendingForRubbing(rubbingId: string, collectionNo: string): Promise<boolean> {
+  const key = collectionNo.trim();
+  if (!key) return false;
+  return db.transaction('rw', [db.rubbings, db.reconClaims], async () => {
+    const claim = await db.reconClaims.where('collectionNo').equals(key).first();
+    if (!claim) return false;
+    const now = Date.now();
+    await db.rubbings.update(rubbingId, {
+      unionCatalogNo: claim.unionCatalogNo,
+      centerDate: claim.centerDate,
+      reconciledAt: now,
+      updatedAt: now,
+    } as never);
+    await db.reconClaims.delete(claim.id);
+    return true;
+  });
 }

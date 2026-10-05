@@ -1,9 +1,18 @@
 /**
  * 拓本 slice（Redux Toolkit）
- * 维护拓本与钤印集合及筛选条件；同一碑刻下自动生成版本序号。
+ * 维护拓本、钤印与中心对账待认领集合及筛选条件；同一碑刻下自动生成版本序号。
  */
 import { createAsyncThunk, createSlice, type PayloadAction } from '@reduxjs/toolkit';
-import { createId, db, removeRubbingCascade, renumberRubbings } from '@/utils/db';
+import {
+  applyReconciliationEntries,
+  claimPendingForRubbing,
+  createId,
+  db,
+  normalizeRubbing,
+  removeRubbingCascade,
+  renumberRubbings,
+} from '@/utils/db';
+import { parseReconList } from '@/utils/recon';
 import {
   nextRubbingState,
   type Rubbing,
@@ -12,6 +21,7 @@ import {
   type RubbingState,
 } from '@/types/rubbing';
 import type { Seal, SealDraft, SealType } from '@/types/seal';
+import type { ReconClaim } from '@/types/recon';
 import type { RootState } from './store';
 
 export interface RubbingFilters {
@@ -24,6 +34,8 @@ export interface RubbingFilters {
 export interface RubbingState2 {
   items: Rubbing[];
   seals: Seal[];
+  /** 中心对账待认领条目（查不到收藏号的中心条目，等认领，不丢弃） */
+  claims: ReconClaim[];
   loading: boolean;
   ready: boolean;
   error: string;
@@ -34,6 +46,7 @@ export interface RubbingState2 {
 const initialState: RubbingState2 = {
   items: [],
   seals: [],
+  claims: [],
   loading: false,
   ready: false,
   error: '',
@@ -42,17 +55,25 @@ const initialState: RubbingState2 = {
 };
 
 export const loadRubbings = createAsyncThunk('rubbing/load', async () => {
-  const [rubbings, seals] = await Promise.all([db.rubbings.toArray(), db.seals.toArray()]);
-  rubbings.sort((a, b) => (a.steleId === b.steleId ? a.versionNo - b.versionNo : a.steleId.localeCompare(b.steleId)));
+  const [rubbings, seals, claims] = await Promise.all([
+    db.rubbings.toArray(),
+    db.seals.toArray(),
+    db.reconClaims.toArray(),
+  ]);
+  const normalized = rubbings.map((row) => normalizeRubbing(row));
+  normalized.sort((a, b) => (a.steleId === b.steleId ? a.versionNo - b.versionNo : a.steleId.localeCompare(b.steleId)));
   seals.sort((a, b) => a.rubbingId.localeCompare(b.rubbingId));
-  return { rubbings, seals };
+  claims.sort((a, b) => b.receivedAt - a.receivedAt);
+  return { rubbings: normalized, seals, claims };
 });
 
 export const createRubbing = createAsyncThunk('rubbing/create', async (draft: RubbingDraft, { dispatch }) => {
   const now = Date.now();
-  const row: Rubbing = { ...draft, id: createId('rub'), createdAt: now, updatedAt: now };
+  const row: Rubbing = normalizeRubbing({ ...draft, id: createId('rub'), createdAt: now, updatedAt: now });
   await db.rubbings.put(row);
   await renumberRubbings(row.steleId);
+  // 该收藏号若挂着中心待认领条目，登记后即自动认领
+  await claimPendingForRubbing(row.id, row.collectionNo);
   await dispatch(loadRubbings());
   return row;
 });
@@ -61,6 +82,10 @@ export const updateRubbing = createAsyncThunk(
   'rubbing/update',
   async (payload: { id: string; patch: Partial<Rubbing> }, { dispatch }) => {
     await db.rubbings.update(payload.id, { ...payload.patch, updatedAt: Date.now() } as never);
+    // 收藏号改动后同样尝试自动认领
+    if (typeof payload.patch.collectionNo === 'string') {
+      await claimPendingForRubbing(payload.id, payload.patch.collectionNo);
+    }
     await dispatch(loadRubbings());
   },
 );
@@ -96,6 +121,38 @@ export const removeRubbing = createAsyncThunk('rubbing/remove', async (id: strin
   const row = state.rubbing.items.find((item) => item.id === id);
   await removeRubbingCascade(id);
   if (row) await renumberRubbings(row.steleId);
+  await dispatch(loadRubbings());
+});
+
+/* ------------------------------ 中心对账 ------------------------------ */
+
+export interface ReconSummary {
+  /** 对上并回填的条数 */
+  matchedCount: number;
+  /** 转入待认领的条数 */
+  claimCount: number;
+  /** 无法解析而跳过的行数 */
+  skipped: number;
+}
+
+/**
+ * 收下中心发回的对账清单：解析 → 单事务入库（失败整体回滚）→ 重新载入。
+ * 解析不出任何有效行时直接拒绝，不写库。
+ */
+export const applyReconciliationList = createAsyncThunk('rubbing/reconcile', async (text: string, { dispatch }) => {
+  const { entries, skipped } = parseReconList(text);
+  if (entries.length === 0) {
+    throw new Error('没有可识别的对账行，请检查格式：一行一条，依次为收藏号、联合目录号、中心著录年代');
+  }
+  const result = await applyReconciliationEntries(entries);
+  await dispatch(loadRubbings());
+  const summary: ReconSummary = { matchedCount: result.matchedCount, claimCount: result.claimCount, skipped };
+  return summary;
+});
+
+/** 中心撤回某条待认领条目时手工移除 */
+export const removeReconClaim = createAsyncThunk('rubbing/removeClaim', async (id: string, { dispatch }) => {
+  await db.reconClaims.delete(id);
   await dispatch(loadRubbings());
 });
 
@@ -164,6 +221,7 @@ const rubbingSlice = createSlice({
       .addCase(loadRubbings.fulfilled, (state, action) => {
         state.items = action.payload.rubbings;
         state.seals = action.payload.seals;
+        state.claims = action.payload.claims;
         state.loading = false;
         state.ready = true;
         state.error = '';
@@ -191,6 +249,7 @@ export const {
 export const selectRubbingState = (state: RootState): RubbingState2 => state.rubbing;
 export const selectRubbings = (state: RootState): Rubbing[] => state.rubbing.items;
 export const selectSeals = (state: RootState): Seal[] => state.rubbing.seals;
+export const selectReconClaims = (state: RootState): ReconClaim[] => state.rubbing.claims;
 export const selectCurrentRubbingId = (state: RootState): string | null => state.rubbing.currentRubbingId;
 
 /** 派生选择器：关键字 + 拓法 + 状态 + 碑刻过滤 */
