@@ -71,6 +71,7 @@ npm run preview    # 本地预览构建产物（http://localhost:22820）
 | `/rubbings` | 拓本登记 | 录入拓法、纸墨、尺寸与收藏号；同碑自动生成版本序号，钤印增删改与批量调整印别，批量改状态 | Rubbing、Seal、Stele |
 | `/losses` | 损泐字位标注台 | 行号 × 字位网格逐格标注，批量改严重程度；选定基准拓本即时高亮差异字位 | Loss、Rubbing |
 | `/compare` | 同碑多版本比对与断代 | 选定 A/B 两拓本，按字位坐标比对损泐集合并排展示差异，推断早本 / 晚本 / 同版 / 待考并落库 | Compare、Loss、Rubbing |
+| `/reconcile` | 中心联合目录对账台 | 收下中心发回的对账清单（一行一条：收藏号 + 联合目录号 + 中心著录年代），按收藏号核对补录；对上的只补联合目录号与中心著录年代，查不到的列作待认领 | Rubbing、PendingReconciliation |
 | `/export` | 编目卡生成与导出 | 按碑刻生成编目卡文本、合订导出、钤印明细、JSON 导入导出、损泐台账 CSV、清空重播种 | 全部模型 |
 
 `/` 与未匹配路径重定向到 `/steles`。筛选条件写入 URL query（`?kw=&method=&state=` 等），可直接分享带条件的链接。
@@ -82,7 +83,8 @@ npm run preview    # 本地预览构建产物（http://localhost:22820）
 | 模型 | 文件 | 关键字段 | 说明 |
 | --- | --- | --- | --- |
 | Stele 碑刻 | `src/types/stele.ts` | `id` `title` `era` `location` `form`（碑/碣/摩崖/墓志） `sizeCm` `calligrapher` | 新建后进入拓本登记，卡片回显拓本数与差异条数 |
-| Rubbing 拓本 | `src/types/rubbing.ts` | `id` `steleId` `versionNo` `method`（擦拓/扑拓/蝉翼拓） `paperType` `inkTone`（浓墨/淡墨） `sizeCm` `collectionNo` `dateGuess` `state`（待编目/已编目/待比对） | 同碑多份并存，版本序号自动生成 |
+| Rubbing 拓本 | `src/types/rubbing.ts` | `id` `steleId` `versionNo` `method`（擦拓/扑拓/蝉翼拓） `paperType` `inkTone`（浓墨/淡墨） `sizeCm` `collectionNo` `dateGuess` `state`（待编目/已编目/待比对） `unionNo` `centerDate` `reconciledAt` | 同碑多份并存，版本序号自动生成；`unionNo` / `centerDate` / `reconciledAt` 由中心对账补录，未对账为空 |
+| PendingReconciliation 待认领对账 | `src/types/reconcile.ts` | `collectionNo`（主键） `unionNo` `centerDate` `createdAt` `updatedAt` | 中心发回但本馆拓本查不到的收藏号，列作待认领不丢弃；可手动认领或重新核对 |
 | Loss 损泐字位 | `src/types/loss.ts` | `id` `rubbingId` `lineNo` `charNo` `type`（缺字/裂痕/漫漶/石花） `severity`（轻/中/重） `note` | 按行列网格标注，同碑同字位自动并排对比 |
 | Seal 钤印 | `src/types/seal.ts` | `id` `rubbingId` `sealText` `position` `transcription` `sealType`（收藏印/鉴赏印/作者印） | 按位置排序展示，支持批量改印别 |
 | Compare 版本比对 | `src/types/compare.ts` | `id` `steleId` `rubbingIdA` `rubbingIdB` `diffCount` `conclusion`（早本/晚本/同版/待考） `operator` `date` | 选定两拓本即生成差异清单并回写断代结论 |
@@ -97,11 +99,11 @@ npm run preview    # 本地预览构建产物（http://localhost:22820）
 sologsb101-1020/
 ├── frontend/                     # 前端源码
 │   ├── src/
-│   │   ├── types/                # stele.ts rubbing.ts loss.ts seal.ts compare.ts
-│   │   ├── stores/               # steleSlice.ts rubbingSlice.ts lossSlice.ts store.ts
+│   │   ├── types/                # stele.ts rubbing.ts loss.ts seal.ts compare.ts reconcile.ts
+│   │   ├── stores/               # steleSlice.ts rubbingSlice.ts lossSlice.ts reconcileSlice.ts store.ts
 │   │   ├── components/common/    # LossTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
 │   │   ├── hooks/                # useLossDiff.ts useIdbTable.ts
-│   │   ├── pages/                # SteleList.tsx RubbingList.tsx LossBoard.tsx CompareView.tsx ExportView.tsx
+│   │   ├── pages/                # SteleList.tsx RubbingList.tsx LossBoard.tsx CompareView.tsx ReconcileView.tsx ExportView.tsx
 │   │   ├── router/               # index.tsx
 │   │   ├── utils/                # collate.ts db.ts export.ts
 │   │   ├── styles/               # main.css
@@ -123,9 +125,11 @@ sologsb101-1020/
 
 ## 七、数据存储说明
 
-- **IndexedDB（Dexie，数据库名 `gbrubbing`）**：5 张业务表 `steles` / `rubbings` / `losses` / `seals` / `compares`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Stele → Rubbing → Loss / Seal，另有 Stele → Compare，固定 id 如 `stele_01`、`rub_0101`、`loss_010101`），播种幂等，保证字位网格与比对台打开即有内容。
+- **IndexedDB（Dexie，数据库名 `gbrubbing`）**：6 张业务表 `steles` / `rubbings` / `losses` / `seals` / `compares` / `pendingReconciliations`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；`initDatabase()` 首次打开时自动播种**三层互相引用**的演示数据（Stele → Rubbing → Loss / Seal，另有 Stele → Compare，固定 id 如 `stele_01`、`rub_0101`、`loss_010101`），播种幂等，保证字位网格与比对台打开即有内容。
+- **数据结构版本号 `DB_SCHEMA_VERSION`**：当前为 `v3`。`v1→v2` 为 `losses` 表增加 `charNo` 与 `[rubbingId+lineNo+charNo]` 复合索引；`v2→v3` 新增 `pendingReconciliations` 待认领表，并为已有拓本回填 `unionNo` / `centerDate` / `reconciledAt`（置空，按未对账显示，不触碰编目员填写的拓法、纸墨、尺寸与损泐字位）。
+- **对账写入事务**：`reconcileList` / `claimPending` / `recheckPending` 等对账写入均在 `db.transaction('rw', ...)` 内执行，任一失败整体回滚到贴之前的样子；同一收藏号的中心著录年代以晚到的为准，编目员的 `dateGuess` 不覆盖。
 - **localStorage**：仅存元数据 —— `gbrubbing:db-version`（本地结构版本）、`gbrubbing:last-backup-at`（最近导出时间）、`gbrubbing:ui-prefs`（当前碑刻 / 拓本）。
-- **备份**：`/export` 页可导出 JSON（5 张表全量数据 + 结构版本号），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；另有编目卡 TXT 与损泐台账 CSV。
+- **备份**：`/export` 页可导出 JSON（6 张表全量数据 + 结构版本号，含待认领对账条目），导入时校验 `app` 字段与各集合数组完整性，覆盖导入前二次确认；另有编目卡 TXT 与损泐台账 CSV。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---

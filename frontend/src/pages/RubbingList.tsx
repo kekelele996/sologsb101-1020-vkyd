@@ -218,6 +218,22 @@ export default function RubbingList() {
     { title: '收藏号', dataIndex: 'collectionNo', width: 120, render: (value: string) => value || '未编' },
     { title: '年代判断', dataIndex: 'dateGuess', width: 120, render: (value: string) => value || '待考' },
     {
+      title: '对账',
+      key: 'reconcile',
+      width: 150,
+      render: (_value, record) =>
+        record.reconciledAt !== null && record.reconciledAt > 0 ? (
+          <Space direction="vertical" size={0}>
+            <Typography.Text style={{ fontSize: 12 }}>联合目录号 {record.unionNo || '—'}</Typography.Text>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              中心著录 {record.centerDate || '—'}
+            </Typography.Text>
+          </Space>
+        ) : (
+          <Tag>未对账</Tag>
+        ),
+    },
+    {
       title: '损泐 / 钤印',
       key: 'counts',
       width: 130,

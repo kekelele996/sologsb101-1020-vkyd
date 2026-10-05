@@ -48,11 +48,29 @@ export const loadRubbings = createAsyncThunk('rubbing/load', async () => {
   return { rubbings, seals };
 });
 
-export const createRubbing = createAsyncThunk('rubbing/create', async (draft: RubbingDraft, { dispatch }) => {
+export const createRubbing = createAsyncThunk('rubbing/create', async (draft: RubbingDraft, { dispatch, getState }) => {
   const now = Date.now();
   const row: Rubbing = { ...draft, id: createId('rub'), createdAt: now, updatedAt: now };
   await db.rubbings.put(row);
   await renumberRubbings(row.steleId);
+  // 自动认领：若该收藏号有中心待认领条目，一并补上联合目录号与中心著录年代
+  const state = getState() as RootState;
+  const pending = state.reconcile.pending.find((item) => item.collectionNo.trim() === row.collectionNo.trim());
+  if (pending) {
+    try {
+      await db.transaction('rw', [db.rubbings, db.pendingReconciliations], async () => {
+        await db.rubbings.update(row.id, {
+          unionNo: pending.unionNo,
+          centerDate: pending.centerDate,
+          reconciledAt: now,
+          updatedAt: now,
+        } as never);
+        await db.pendingReconciliations.delete(pending.collectionNo);
+      });
+    } catch {
+      // 自动认领失败不阻断拓本创建，待认领条目保留以便手动认领
+    }
+  }
   await dispatch(loadRubbings());
   return row;
 });

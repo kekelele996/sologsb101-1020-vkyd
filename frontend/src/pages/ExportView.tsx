@@ -37,6 +37,7 @@ import { selectCompares, selectLosses } from '@/stores/lossSlice';
 import { SEAL_TYPE_COLOR, SEAL_TYPE_LABEL, sealPositionWeight, type Seal, type SealType } from '@/types/seal';
 import { RUBBING_METHOD_LABEL, RUBBING_STATE_LABEL } from '@/types/rubbing';
 import { COMPARE_CONCLUSION_COLOR, COMPARE_CONCLUSION_LABEL } from '@/types/compare';
+import { selectPendingReconciliations } from '@/stores/reconcileSlice';
 import {
   DB_NAME,
   DB_SCHEMA_VERSION,
@@ -67,6 +68,7 @@ export default function ExportView() {
   const losses = useAppSelector(selectLosses);
   const compares = useAppSelector(selectCompares);
   const sealTable = useIdbTable<Seal>((database) => database.seals, { sortByUpdatedAt: false });
+  const pendingReconciliations = useAppSelector(selectPendingReconciliations);
 
   const [steleId, setSteleId] = useState<string>('');
   const [lastBackupAt, setLastBackupAt] = useState<string | null>(readLastBackupAt());
@@ -240,6 +242,7 @@ export default function ExportView() {
         <StatBadge label="损泐字位" value={stat.losses} suffix="条" tone="warning" />
         <StatBadge label="钤印" value={stat.seals} suffix="方" />
         <StatBadge label="比对记录" value={stat.compares} suffix="条" tone="danger" />
+        <StatBadge label="待认领对账" value={pendingReconciliations.length} suffix="条" tone="warning" />
         <StatBadge label="已定断代占比" value={`${stat.passPercent}%`} percent={stat.passPercent} tone="success" />
       </div>
 
